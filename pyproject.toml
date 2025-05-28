@@ -1,0 +1,21 @@
+[project]
+name = "image-straightener"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "deepthought", email = "deepthough@postech.ac.kr" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.2.1",
+    "numpy>=2.2.6",
+    "opencv-python>=4.11.0.86",
+]
+
+[project.scripts]
+image-straightener = "image_straightener.batch_scan:batch_scan"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
