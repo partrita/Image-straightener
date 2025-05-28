@@ -10,7 +10,6 @@
 
 ```bash
 uv sync
-uv build
 uv run image-straightener -i data/input/ -o data/output/
 ```
 
