@@ -4,6 +4,9 @@ import numpy as np
 import glob
 from os.path import basename, join, exists, splitext
 from os import makedirs
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import logging
 
 
 class PyImageSearch:
@@ -98,70 +101,53 @@ def process_image(image_path, output_dir):
     Processes a single image for document scanning, including edge detection,
     perspective transform, and saving the result.
     """
-    file_name_without_ext, file_extension = splitext(basename(image_path))
+    file_name = basename(image_path)
+    file_name_without_ext, file_extension = splitext(file_name)
     output_path = join(output_dir, f"{file_name_without_ext}{file_extension}")
 
-    image = cv2.imread(image_path)
-    if image is None:
-        click.echo(
-            f"Skipping {basename(image_path)}: Not a valid image file or could not be read by OpenCV."
-        )
-        return
+    try:
+        image = cv2.imread(image_path)
+        if image is None:
+            logging.warning(f"Skipping {file_name}: Not a valid image file or could not be read by OpenCV.")
+            return
 
-    original_image = image.copy()
-    # screen_contour의 점들은 resize된 display_image 기준으로 찾아지므로,
-    # 원본 이미지에 적용하기 위해 ratio를 곱해줘야 합니다.
-    # screen_contour.reshape(4, 2) * ratio는 이미 적용되고 있습니다.
-    # ratio 계산은 original_image를 기준으로 하며, display_image 생성 시 사용됩니다.
-    ratio = original_image.shape[0] / 500.0
-    display_image = imutils.resize(image.copy(), height=500)
+        original_image = image.copy()
+        ratio = original_image.shape[0] / 500.0
+        display_image = imutils.resize(image.copy(), height=500)
 
-    gray = cv2.cvtColor(display_image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    edged = auto_canny(blurred)
+        gray = cv2.cvtColor(display_image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        edged = auto_canny(blurred)
 
-    click.echo(f"Processing {basename(image_path)}: Detecting edges...")
+        results = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours = results[0] if len(results) == 2 else results[1]
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
 
-    results = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = results[0] if len(results) == 2 else results[1]
+        screen_contour = None
+        for c in contours:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4:
+                screen_contour = approx
+                break
 
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-
-    screen_contour = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-
-        if len(approx) == 4:
-            screen_contour = approx
-            break
-
-    if screen_contour is not None:
-        cv2.drawContours(display_image, [screen_contour], -1, (0, 255, 0), 2)
-        cv2.imshow("Outline - Press SPACE to warp, ESC to save original", display_image)
-        key = cv2.waitKey(0) & 0xFF
-        cv2.destroyAllWindows()
-
-        if key == 32:  # Space key
-            click.echo(f"{basename(image_path)}: Applying perspective transform...")
-            # 여기에서 screen_contour.reshape(4, 2) * ratio를 four_point_transform에 전달하여
-            # 원본 이미지에 맞게 스케일링된 점을 사용합니다.
-            warped = four_point_transform(
-                original_image, screen_contour.reshape(4, 2) * ratio
-            )
+        if screen_contour is not None:
+            warped = four_point_transform(original_image, screen_contour.reshape(4, 2) * ratio)
             warped = increase_contrast(warped)
             cv2.imwrite(output_path, warped)
-            click.echo(
-                f"Successfully scanned and saved {basename(image_path)} to {output_path}"
-            )
-        else:  # ESC key or any other key
-            click.echo(f"{basename(image_path)}: Saving original image as requested.")
+            logging.info(f"Successfully scanned and saved {file_name} to {output_path}")
+        else:
+            logging.info(f"No clear document outline found for {file_name}. Saving original image.")
             cv2.imwrite(output_path, original_image)
-    else:
-        click.echo(
-            f"{basename(image_path)}: No clear document outline found. Saving original image."
-        )
-        cv2.imwrite(output_path, original_image)
+    except Exception as e:
+        logging.error(f"ERROR processing {file_name}: {e}")
+        try:
+            original_image = cv2.imread(image_path)
+            if original_image is not None:
+                cv2.imwrite(output_path, original_image)
+                logging.warning(f"Saved original {file_name} to {output_path} due to error.")
+        except Exception as save_e:
+            logging.error(f"Further error saving original {file_name}: {save_e}")
 
 
 @click.command()
@@ -179,28 +165,42 @@ def process_image(image_path, output_dir):
     type=click.Path(file_okay=False, dir_okay=True),
     help="Path to the directory where scanned images will be saved.",
 )
-def batch_scan(input_path, output_path):
+@click.option(
+    "-w",
+    "--workers",
+    default=cpu_count(),
+    type=int,
+    help="Number of worker processes to use for parallel processing.",
+)
+@click.option(
+    "-l",
+    "--log_file",
+    default="batch_scan.log",
+    type=str,
+    help="Path to the log file.",
+)
+def batch_scan(input_path, output_path, workers, log_file):
     """
     A batch document scanning tool.
 
     This script processes all files in the INPUT_PATH directory that OpenCV can
     read as images. For each valid image, it attempts to detect document edges.
-    A window will appear showing the detected outline.
-
-    - Press 'SPACE' to apply the perspective transform and save the scanned image.
-    - Press 'ESC' (or any other key) to save the original image if edge detection is incorrect or skipped.
-
-    Processed images are saved to the OUTPUT_PATH directory, retaining their
-    original file extension.
+    The script automatically applies perspective transform and saves the scanned image.
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+    )
+
     if not exists(output_path):
         makedirs(output_path)
-        click.echo(f"Created output directory: {output_path}")
+        logging.info(f"Created output directory: {output_path}")
 
     all_files_in_input_dir = glob.glob(join(input_path, "*"))
 
     image_files = []
-    click.echo("Detecting readable image files...")
+    logging.info("Detecting readable image files...")
     for file_path in all_files_in_input_dir:
         temp_img = cv2.imread(file_path)
         if temp_img is not None:
@@ -209,38 +209,20 @@ def batch_scan(input_path, output_path):
     image_files.sort()
 
     if not image_files:
-        click.echo(
+        logging.warning(
             f"No readable image files found in {input_path}. Please ensure your directory contains valid image formats that OpenCV can decode. Exiting."
         )
         return
 
     total_images = len(image_files)
-    click.echo(f"Found {total_images} readable images to process in {input_path}")
+    logging.info(f"Found {total_images} readable images to process in {input_path}")
 
-    for i, image_file in enumerate(image_files):
-        click.echo(f"\n[{i + 1}/{total_images}]")
-        try:
-            process_image(image_file, output_path)
-        except Exception as e:
-            click.echo(f"ERROR processing {basename(image_file)}: {e}")
-            try:
-                original_image = cv2.imread(image_file)
-                if original_image is not None:
-                    _, original_ext = splitext(image_file)
-                    error_output_path = join(
-                        output_path,
-                        f"{splitext(basename(image_file))[0]}{original_ext}",
-                    )
-                    cv2.imwrite(error_output_path, original_image)
-                    click.echo(
-                        f"Saved original {basename(image_file)} to {error_output_path} due to error."
-                    )
-            except Exception as save_e:
-                click.echo(
-                    f"Further error saving original {basename(image_file)}: {save_e}"
-                )
+    process_func = partial(process_image, output_dir=output_path)
 
-    click.echo("\nAll images processed. DONE!")
+    with Pool(workers) as pool:
+        results = list(pool.imap_unordered(process_func, image_files))
+
+    logging.info("\nAll images processed. DONE!")
 
 
 if __name__ == "__main__":
